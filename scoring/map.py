@@ -9,31 +9,21 @@ from typing import (
     List,
     Mapping,
     Optional,
-    Protocol,
-    Sequence,
     Union,
     cast,
 )
 
-from statline.utils.timing import StageTimes
+from statline.core.types.scoring import AdapterProtocol
+from statline.core.types.timing import StageTimes
 
-from .scoring import calculate_pri
-from .scoring import passes_raw_filters as _passes_raw_filters
+from .score import calculate_pri
+from .score import passes_mapped_filters as _passes_mapped_filters
+from .score import passes_raw_filters as _passes_raw_filters
 
 WeightsArg = Optional[Union[str, Dict[str, float]]]
 OutputArg = Optional[Dict[str, Any]]
 
 
-class AdapterProto(Protocol):
-    """Minimal adapter surface used by the raw-row calculator."""
-
-    @property
-    def key(self) -> str: ...
-
-    @property
-    def metrics(self) -> Sequence[Any] | Any: ...
-
-    def map_raw(self, raw: Mapping[str, Any]) -> Mapping[str, Any]: ...
 
 
 def _sanitize_numeric_metrics(raw_metrics: Mapping[str, Any]) -> Dict[str, Any]:
@@ -57,23 +47,14 @@ def _sanitize_numeric_metrics(raw_metrics: Mapping[str, Any]) -> Dict[str, Any]:
     return numeric_metrics
 
 
-def _get_mapper(adapter: AdapterProto) -> Callable[[Mapping[str, Any]], Mapping[str, Any]]:
-    """
-    Return the adapter's mapping function.
-    Prefer legacy map_raw_to_metrics when present; otherwise use compiled-adapter map_raw.
-    """
-    fn = getattr(adapter, "map_raw_to_metrics", None)
-    if callable(fn):
-        return cast(Callable[[Mapping[str, Any]], Mapping[str, Any]], fn)
-
-    fn = getattr(adapter, "map_raw", None)
-    if callable(fn):
-        return cast(Callable[[Mapping[str, Any]], Mapping[str, Any]], fn)
-
-    raise RuntimeError("Adapter has neither map_raw nor map_raw_to_metrics.")
+def _get_mapper(adapter: AdapterProtocol) -> Callable[[Mapping[str, Any]], Mapping[str, Any]]:
+    mapper = getattr(adapter, "map_raw", None)
+    if callable(mapper):
+        return cast(Callable[[Mapping[str, Any]], Mapping[str, Any]], mapper)
+    raise RuntimeError("Adapter has no map_raw function.")
 
 
-def safe_map_raw(adapter: AdapterProto, raw_metrics: Mapping[str, Any]) -> Dict[str, Any]:
+def safe_map_raw(adapter: AdapterProtocol, raw_metrics: Mapping[str, Any]) -> Dict[str, Any]:
     """
     Map a raw row through the adapter after tolerant numeric sanitization.
     """
@@ -102,7 +83,7 @@ def safe_map_raw(adapter: AdapterProto, raw_metrics: Mapping[str, Any]) -> Dict[
 
 def score_rows_from_raw(
     raw_rows: Iterable[Mapping[str, Any]],
-    adapter: AdapterProto,
+    adapter: AdapterProtocol,
     *,
     weights_override: Optional[Dict[str, float]] = None,
     weights: WeightsArg = None,
@@ -126,25 +107,26 @@ def score_rows_from_raw(
     else:
         mapped_rows = [safe_map_raw(adapter, r) for r in raw_list]
 
-    return cast(
-        List[Dict[str, Any]],
-        calculate_pri(
-            mapped_rows,
-            adapter=adapter,
-            weights_override=weights_override,
-            weights=weights,
-            penalties_override=penalties_override,
-            output=output,
-            context=context,
-            caps_override=caps_override,
-            timing=timing,
-        ),
-    )  # pyright: ignore[reportUnnecessaryCast]
+    if filters:
+        mapped_rows = [
+            r for r in mapped_rows if _passes_mapped_filters(r, filters, adapter=adapter)
+        ]
+    return calculate_pri(
+        mapped_rows,
+        adapter=adapter,
+        weights_override=weights_override,
+        weights=weights,
+        penalties_override=penalties_override,
+        output=output,
+        context=context,
+        caps_override=caps_override,
+        timing=timing,
+    )
 
 
 def score_row_from_raw(
     raw_row: Mapping[str, Any],
-    adapter: AdapterProto,
+    adapter: AdapterProtocol,
     *,
     weights_override: Optional[Dict[str, float]] = None,
     weights: WeightsArg = None,
@@ -174,7 +156,6 @@ def score_row_from_raw(
 
 
 __all__ = [
-    "AdapterProto",
     "safe_map_raw",
     "score_rows_from_raw",
     "score_row_from_raw",

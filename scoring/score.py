@@ -19,9 +19,12 @@ from typing import (
 )
 
 # Reuse the adapter compiler’s safe numeric semantics
-from .adapters.compile import _finite as _finite_num  # type: ignore
-from .adapters.types import FilterSpec, ScoreProfileSpec  # typed schema
-from .normalization import clamp01
+from statline.core.adapters.compile import (
+    _finite as _finite_num,  # pyright: ignore[reportPrivateUsage]
+)
+from statline.core.types.adapters import FilterSpec, ScoreProfileSpec  # typed schema
+
+from .normalize import clamp01
 from .weights import normalize_weights
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -150,7 +153,7 @@ def _score_from_profile(
     Typed-first: ScoreProfileSpec, but stays tolerant of Mapping[str, Any] for legacy.
     """
     if isinstance(prof_any, ScoreProfileSpec):
-        kind = str(prof_any.kind or "affine").strip().lower()
+        kind = str(prof_any.kind).strip().lower()
 
         if kind == "affine":
             lo = _profile_float(prof_any.lo, 55.0)
@@ -573,6 +576,15 @@ def _passes_declared_adapter_filters_typed(
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+_RESERVED_FILTER_KEYS: Tuple[str, ...] = (
+    "dimensions",
+    "stat_where",
+    "stat_where_mode",
+    "position",
+    "games_played_gte",
+)
+
+
 def _passes_dimension_filters(
     raw: Mapping[str, Any], filters: Optional[Dict[str, Any]], adapter: Any
 ) -> bool:
@@ -626,6 +638,31 @@ def _passes_dimension_filters(
     return True
 
 
+def passes_mapped_filters(
+    mapped: Mapping[str, Any],
+    filters: Optional[Dict[str, Any]],
+    *,
+    adapter: Optional[Any] = None,
+) -> bool:
+    """Return whether an already-mapped row passes adapter metric filters.
+
+    Dimension filters are intentionally handled before mapping by
+    passes_raw_filters. Metric filters need to run after mapping because
+    adapter filter fields are canonical metric names, not necessarily raw CSV
+    headers.
+    """
+    if not filters or adapter is None:
+        return True
+
+    return _passes_declared_adapter_filters_typed(
+        mapped,
+        adapter,
+        filters,
+        kind="metric",
+        reserved_filter_keys=_RESERVED_FILTER_KEYS,
+    )
+
+
 def passes_raw_filters(  # pyright: ignore[reportUnusedFunction]
     raw: Mapping[str, Any],
     filters: Optional[Dict[str, Any]],
@@ -645,26 +682,24 @@ def passes_raw_filters(  # pyright: ignore[reportUnusedFunction]
             adapter,
             filters,
             kind="dimension",
-            reserved_filter_keys=(
-                "dimensions",
-                "stat_where",
-                "stat_where_mode",
-                "position",
-                "games_played_gte",
-            ),
+            reserved_filter_keys=_RESERVED_FILTER_KEYS,
         ):
             return False
 
     if "position" in filters and filters["position"] is not None:
         allowed = filters["position"]
         if isinstance(allowed, (list, tuple, set)):
-            pos = raw.get("position", raw.get("pos", None))
+            pos = _ci_get(raw, "position") or _ci_get(raw, "pos")
             if pos is None or str(pos) not in {str(x) for x in allowed}:  # pyright: ignore[reportUnknownVariableType, reportUnknownArgumentType]
                 return False
 
     if "games_played_gte" in filters and filters["games_played_gte"] is not None:
         want = _to_float(filters["games_played_gte"], 0.0)
-        gp = raw.get("games_played", raw.get("gp", raw.get("games", None)))
+        gp = _ci_get(raw, "games_played")
+        if gp is None:
+            gp = _ci_get(raw, "gp")
+        if gp is None:
+            gp = _ci_get(raw, "games")
         if _to_float(gp, 0.0) < want:
             return False
 
@@ -722,7 +757,7 @@ def calculate_pri(
     Canonical PRI scorer.
 
     Contract:
-    - Input rows are ALREADY mapped (adapter.map_raw/map_raw_to_metrics output).
+    - Input rows are ALREADY mapped (adapter.map_raw/map_raw output).
     - Output is dict-like (JSON friendly).
     """
     # NOTE: `Mapping` is also `Iterable` (iterates keys), so use an actual ABC check + casts
@@ -732,8 +767,7 @@ def calculate_pri(
         mapped_rows: List[Dict[str, Any]] = [dict(row)]
         is_single = True
     else:
-        rows = cast(Iterable[Mapping[str, Any]], rows_or_row)  # pyright: ignore[reportUnnecessaryCast]
-        mapped_rows = [dict(r) for r in rows]
+        mapped_rows = [dict(r) for r in rows_or_row]
         is_single = False
 
     out = _calculate_pri_batch_mapped(
@@ -979,12 +1013,22 @@ def _calculate_pri_batch_mapped(
                     bucket_scores.pop(b, None)
 
             # Compute raw01 per profile
+            is_unscoreable = _to_float(r.get("scoreable", 1.0), 1.0) <= 0.0 or (
+                _to_float(r.get("real_gp", r.get("gp", 1.0)), 1.0) <= 0.0
+                and _to_float(r.get("stat_total", 1.0), 1.0) <= 0.0
+            )
+
             for pname, uw in unit_w_by_profile.items():
                 total = 0.0
                 for mk, w in uw.items():
                     total += comps.get(mk, 0.0) * float(w)
+
                 x01 = clamp01(total)
                 x01 = clamp01(x01 * RAW01_SCALE)
+
+                if is_unscoreable:
+                    x01 = 0.0
+
                 raw01_by_profile[pname].append(x01)
 
             payload: Dict[str, Any] = {
@@ -1002,7 +1046,17 @@ def _calculate_pri_batch_mapped(
         # Percentiles per profile (only used by window profiles, but cheap to compute consistently)
         pct01_by_profile: Dict[str, List[float]] = {}
         for pname, xs in raw01_by_profile.items():
-            pct01_by_profile[pname] = [p / 100.0 for p in _midrank_percentiles(list(xs))]
+            pct_values = [p / 100.0 for p in _midrank_percentiles(list(xs))]
+
+            for idx, r in enumerate(rows_used):
+                is_unscoreable = _to_float(r.get("scoreable", 1.0), 1.0) <= 0.0 or (
+                    _to_float(r.get("real_gp", r.get("gp", 1.0)), 1.0) <= 0.0
+                    and _to_float(r.get("stat_total", 1.0), 1.0) <= 0.0
+                )
+                if is_unscoreable:
+                    pct_values[idx] = 0.0
+
+            pct01_by_profile[pname] = pct_values
 
         # Final pass: build output items
         by_idx: Dict[int, Dict[str, Any]] = {}
@@ -1046,4 +1100,9 @@ def _calculate_pri_batch_mapped(
     return [_apply_output_toggles(r, output) for r in out_list]
 
 
-__all__ = ["PRIResult", "calculate_pri", "passes_raw_filters"]
+__all__ = [
+    "PRIResult",
+    "calculate_pri",
+    "passes_raw_filters",
+    "passes_mapped_filters",
+]
